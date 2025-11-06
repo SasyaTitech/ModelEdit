@@ -4,6 +4,7 @@ from typing import List, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# 本模块提供文本生成与交互式分析工具，既可用于被编辑模型也可用于原模型，支持top-k采样与Logit Lens可视化。
 from util.logit_lens import LogitLens
 
 
@@ -22,8 +23,17 @@ def generate_interactive(
     Puts generation in a loop. Allows users to repeatedly provide inputs
     with which text is generated.
     """
+    # 参数说明:
+    #   model: 待生成的AutoModelForCausalLM实例，可为原模型或编辑后模型
+    #   tok: 与模型匹配的AutoTokenizer
+    #   top_k/max_out_len: 采样空间与生成长度控制
+    #   compare_against: 可选的对比模型，若提供则并列输出生成效果
+    #   use_logit_lens: 是否启用Logit Lens分析各层输出的词概率
+    #   layer_module_tmp/ln_f_module/lm_head_module: 钩取各层表示的模块模板，需与模型架构对应
+    # 函数会进入交互循环，逐条读取用户输入并生成续写
 
     if use_logit_lens:
+        # 初始化针对被编辑模型的Logit Lens工具，它会在forward期间记录各层输出并投影到词表
         llens_gen = LogitLens(
             model,
             tok,
@@ -33,6 +43,7 @@ def generate_interactive(
             disabled=not use_logit_lens,
         )
         if compare_against:
+            # 若提供对比模型，则为其单独构造一个LogitLens实例，两者共用同一tokenizer
             llens_vanilla = LogitLens(
                 compare_against,
                 tok,
@@ -45,6 +56,7 @@ def generate_interactive(
     while True:
         prompt = input("Enter a prompt: ").strip(" \r\t\n")
 
+        # generate_fast一次性执行并行生成，返回str列表；这里每次只生成1个续写
         print(
             f"Argument Model: "
             f"{generate_fast(model, tok, [prompt], n_gen_per_prompt=1, top_k=top_k, max_out_len=max_out_len)}"
@@ -56,6 +68,7 @@ def generate_interactive(
             )
 
         if use_logit_lens:
+            # 将输入prompt编码为批量长度为1的tensor，形状为[1, seq_len]
             inp_prompt = tok([prompt], padding=True, return_tensors="pt").to(
                 next(model.parameters()).device
             )
@@ -66,6 +79,7 @@ def generate_interactive(
             llens_gen.pprint()
 
             if compare_against:
+                # 同样对baseline模型执行一次forward，输出词表概率前k项
                 with llens_vanilla:
                     compare_against(**inp_prompt)
                 print("--- Baseline Model Logit Lens ---")
@@ -86,8 +100,15 @@ def generate_fast(
     Fast, parallelized auto-regressive text generation with top-k sampling.
     Our custom implementation.
     """
+    # 参数说明:
+    #   prompts: 字符串列表，每个元素为一个起始prompt
+    #   n_gen_per_prompt: 为每个prompt生成多少条样本，最终batch大小=batch_len * n_gen_per_prompt
+    #   top_k: top-k采样的候选数
+    #   max_out_len: 最大序列长度，超过则停止
+    # 返回值: 长度等于len(prompts) * n_gen_per_prompt的生成文本列表
 
     # Unroll prompts and tokenize
+    # 将每个prompt复制n_gen_per_prompt次，实现并行自回归生成
     inp = [prompt for prompt in prompts for _ in range(n_gen_per_prompt)]
     inp_tok = tok(inp, padding=True, return_tensors="pt").to(
         next(model.parameters()).device
@@ -102,6 +123,7 @@ def generate_fast(
     past_key_values, cur_context = None, slice(0, attention_mask.sum(1).min().item())
 
     with torch.no_grad():
+        # 该循环通过增量传递input_ids[..., cur_context]来复用past_key_values，减少重复计算
         while input_ids.size(1) < max_out_len:  # while not exceeding max output length
             model_out = model(
                 input_ids=input_ids[:, cur_context],
@@ -113,6 +135,7 @@ def generate_fast(
             softmax_out = torch.nn.functional.softmax(logits[:, -1, :], dim=1)
 
             # Top-k sampling
+            # tk: [batch, top_k]，softmax_out_top_k归一化后进行多项式采样
             tk = torch.topk(softmax_out, top_k, dim=1).indices
             softmax_out_top_k = torch.gather(softmax_out, 1, tk)
             softmax_out_top_k = softmax_out_top_k / softmax_out_top_k.sum(1)[:, None]
@@ -146,6 +169,7 @@ def generate_fast(
 
             cur_context = slice(cur_context.stop, cur_context.stop + 1)
 
+    # 将生成的token序列decode回文本，同时做unicode标准化并去除特殊token
     txt = [tok.decode(x) for x in input_ids.detach().cpu().numpy().tolist()]
     txt = [
         unicodedata.normalize("NFKD", x)

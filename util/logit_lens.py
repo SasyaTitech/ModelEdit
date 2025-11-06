@@ -7,6 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from util import nethook
 
 
+# LogitLens通过在各层输出后直接套用lm_head，观察当前隐藏状态对应的词分布，是定位模型知识流动的重要工具。
 class LogitLens:
     """
     Applies the LM head at the output of each hidden layer, then analyzes the
@@ -29,6 +30,11 @@ class LogitLens:
         lm_head_module: str,
         disabled: bool = False,
     ):
+        # 参数说明:
+        #   model/tok: 任意AutoModelForCausalLM + AutoTokenizer组合
+        #   layer_module_tmp: 字符串模板，用于生成层名并注册Trace钩子，例如"transformer.h.{}"
+        #   ln_f_module/lm_head_module: 最终LayerNorm与输出层的模块名，适配GPT样模型
+        #   disabled: 允许提前禁用，以简化调用端逻辑（无需条件分支）
         self.disabled = disabled
         self.model, self.tok = model, tok
         self.n_layers = self.model.config.n_layer
@@ -46,6 +52,7 @@ class LogitLens:
 
     def __enter__(self):
         if not self.disabled:
+            # TraceDict会在forward期间捕获每层输出；retain_output=True表示保存模块输出张量
             self.td = nethook.TraceDict(
                 self.model,
                 self.trace_layers,
@@ -68,6 +75,7 @@ class LogitLens:
                     cur_out.size(0) == 1
                 ), "Make sure you're only running LogitLens on single generations only."
 
+                # 对每层的最后一个token表示执行LayerNorm与LMHead，得到词表概率
                 self.output[layer] = torch.softmax(
                     self.lm_head(self.ln_f(cur_out[:, -1, :])), dim=1
                 )
@@ -75,6 +83,7 @@ class LogitLens:
         return self.output
 
     def pprint(self, k=5):
+        # 展示每一层Top-k预测结果，返回(k个token, 概率)元组列表
         to_print = defaultdict(list)
 
         for layer, pred in self.output.items():

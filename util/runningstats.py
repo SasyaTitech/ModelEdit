@@ -41,6 +41,8 @@ compute the statistic, adopting the convention that cached stats are
 saved to and loaded from numpy npz files.
 """
 
+# 该模块封装了多种在线统计量（均值、协方差、分位数等），可在遍历大规模数据集时累积统计并支持缓存。
+# 在模型编辑任务中，这些工具用于估计隐藏层统计(如二阶矩)，亦适用于其他需要批量增量计算的场景。
 import math
 import os
 import random
@@ -96,6 +98,8 @@ def tally(stat, dataset, cache=None, quiet=False, **kwargs):
         random_sample=S is specified, the pseudorandom seed S will be
         used to select a fixed psedorandom sample of size N to sample.
     """
+    # tally会根据cache参数决定是否直接加载缓存；若需重新计算，则返回一个生成器，可用于for循环累加统计。
+    # dataset既可为torch Dataset，也可为callable返回Dataset的函数；kwargs会传递给DataLoader。
     assert isinstance(stat, Stat)
     args = {}
     for k in ["sample_size"]:
@@ -245,6 +249,7 @@ class Mean(Stat):
         self.data_shape = None
 
     def add(self, a):
+        # a形状为[batch, ...]，归一化后变为[batch, features]
         a = self._normalize_add_shape(a)
         if len(a) == 0:
             return
@@ -300,6 +305,7 @@ class NormMean(Mean):
         super().__init__(state)
 
     def add(self, a):
+        # 计算每个样本的L2范数，再调用均值更新；常用于估计隐藏表示的平均长度
         super().add(a.norm(dim=-1))
 
 
@@ -319,6 +325,7 @@ class Variance(Stat):
         self.data_shape = None
 
     def add(self, a):
+        # 与Mean类似但额外维护中心矩平方和，用Chan算法保证数值稳定
         a = self._normalize_add_shape(a)
         if len(a) == 0:
             return
@@ -401,6 +408,7 @@ class Covariance(Stat):
         self.data_shape = None
 
     def add(self, a):
+        # 期待输入形状[batch, feature]，cmom2存储未归一化的协方差accumulator
         a = self._normalize_add_shape(a)
         if len(a) == 0:
             return
@@ -481,6 +489,7 @@ class SecondMoment(Stat):
         self.split_batch = split_batch
 
     def add(self, a):
+        # 返回的矩阵为 E[x x^T]，不减均值，适用于协方差预条件化等操作
         a = self._normalize_add_shape(a)
         if len(a) == 0:
             return
@@ -1359,6 +1368,7 @@ class CombinedStat(Stat):
     """
 
     def __init__(self, state=None, **kwargs):
+        # kwargs为子统计对象的命名参数，形如{"mom2": SecondMoment(), "mean": Mean()}
         self._objs = kwargs
         if state is not None:
             return super().__init__(state)

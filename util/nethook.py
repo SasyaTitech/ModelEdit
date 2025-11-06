@@ -8,6 +8,8 @@ get_module, replace_module, get_parameter resolve dotted names.
 set_requires_grad recursively sets requires_grad in module parameters.
 """
 
+# 该模块是定位与编辑方法的基础设施，提供对torch.nn.Module的hook、子模块提取、梯度控制等通用工具。
+# 通过这些函数，可以无侵入地观察或修改任意层的输入/输出，从而实现ROME、MEMIT、微调等算法的插桩。
 import contextlib
 import copy
 import inspect
@@ -70,6 +72,7 @@ class Trace(contextlib.AbstractContextManager):
 
         def retain_hook(m, inputs, output):
             if retain_input:
+                # inputs为tuple/list，常见形状: (batch, seq, hidden)，会根据需求clone/detach
                 retainer.input = recursive_copy(
                     inputs[0] if len(inputs) == 1 else inputs,
                     clone=clone,
@@ -155,6 +158,7 @@ class TraceDict(OrderedDict, contextlib.AbstractContextManager):
             yield True, prev
 
         for is_last, layer in flag_last_unseen(layers):
+            # 为每个层名注册一个Trace。当stop=True时，仅在最后一个层触发StopForward
             self[layer] = Trace(
                 module=module,
                 layer=layer,
@@ -202,6 +206,7 @@ def recursive_copy(x, clone=None, detach=None, retain_grad=None):
     optionally detaching and cloning the tensor(s).  If retain_grad is
     true, the original tensors are marked to have grads retained.
     """
+    # 调用场景: 保存hook出的张量，或者在修改输出时插入额外的copy，防止in-place冲突
     if not clone and not detach and not retain_grad:
         return x
     if isinstance(x, torch.Tensor):
@@ -244,6 +249,8 @@ def subsequence(
     and their parameters without copying them.  Otherwise, by default,
     makes a separate brand-new copy.
     """
+    # 该函数常用于截取Transformer中的部分层，例如抽取若干MLP层进行单独推理或插桩。
+    # 参数支持通过first/last或after/upto等方式指定闭区间或开区间，single_layer用于直接抽取单层。
     assert (single_layer is None) or (
         first_layer is last_layer is after_layer is upto_layer is None
     )
@@ -342,6 +349,7 @@ def set_requires_grad(requires_grad, *models):
     Sets requires_grad true or false for all parameters within the
     models passed.
     """
+    # 可对整个模型或单个Parameter/Tensor设定requires_grad，常用于冻结除少数变量外的全部参数。
     for model in models:
         if isinstance(model, torch.nn.Module):
             for param in model.parameters():
@@ -356,6 +364,7 @@ def get_module(model, name):
     """
     Finds the named module within the given model.
     """
+    # name采用点分路径，如"transformer.h.10.mlp"
     for n, m in model.named_modules():
         if n == name:
             return m
@@ -366,6 +375,7 @@ def get_parameter(model, name):
     """
     Finds the named parameter within the given model.
     """
+    # name同样采用模型.named_parameters()中的全路径
     for n, p in model.named_parameters():
         if n == name:
             return p
@@ -376,6 +386,7 @@ def replace_module(model, name, new_module):
     """
     Replaces the named module within the given model.
     """
+    # 支持嵌套路径；替换后原模块即被new_module取代，可用于注入Adapter或自定义逻辑
     if "." in name:
         parent_name, attr_name = name.rsplit(".", 1)
         model = get_module(model, parent_name)
