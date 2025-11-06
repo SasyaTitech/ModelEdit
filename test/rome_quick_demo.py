@@ -4,21 +4,17 @@ ROME 最小化示例脚本
 该脚本演示如何：
 1. 下载并加载预训练语言模型；
 2. 使用 ROME 对单条事实执行一次秩一编辑；
-3. 通过简单的概率可视化对比编辑前后的模型行为。
+3. 通过 util.rome_visualization 可视化编辑前后 logits 的变化。
 """
 
 import json
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")  # 兼容无图形界面的服务器
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rome import ROMEHyperParams, apply_rome_to_model
+from util.rome_visualization import plot_full_logit_scatter, plot_topk_logits
 
 
 def load_hparams(model_tag: str) -> ROMEHyperParams:
@@ -62,58 +58,13 @@ def final_token_logits(
     return logits[0, -1, :].cpu()
 
 
-def plot_probability_shift(
-    before_logits: torch.Tensor,
-    after_logits: torch.Tensor,
-    tok: AutoTokenizer,
-    output_path: Path,
-    top_k: int = 6,
-) -> None:
-    """绘制编辑前后概率变化的水平条形图。"""
-    probs_before = torch.softmax(before_logits, dim=-1)
-    probs_after = torch.softmax(after_logits, dim=-1)
-
-    top_before = torch.topk(probs_before, top_k)
-    top_after = torch.topk(probs_after, top_k)
-
-    ordered_ids = []
-    seen = set()
-    for idx in torch.cat([top_before.indices, top_after.indices]).tolist():
-        if idx not in seen:
-            ordered_ids.append(idx)
-            seen.add(idx)
-
-    labels, before_vals, after_vals = [], [], []
-    for idx in ordered_ids:
-        token = tok.decode([idx])
-        if token == "":
-            token = tok.convert_ids_to_tokens(idx)
-        labels.append(token.replace("\n", "\\n"))
-        before_vals.append(probs_before[idx].item())
-        after_vals.append(probs_after[idx].item())
-
-    y_pos = np.arange(len(labels))
-    plt.figure(figsize=(8, max(3, 0.45 * len(labels))))
-    plt.barh(y_pos - 0.15, before_vals, height=0.3, label="Before", color="#8ecae6")
-    plt.barh(y_pos + 0.15, after_vals, height=0.3, label="After", color="#ffb703")
-    plt.xlabel("Token Probability")
-    plt.yticks(y_pos, labels)
-    plt.title("ROME Edit Probability Shift")
-    plt.legend()
-    plt.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-
-
 def main():
     # ====== 1. 基础配置 ======
-    model_name = "gpt2-medium"
+    model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
     request = {
-        "prompt": "{} is located in",
-        "subject": "Mount Everest",
-        # 将“所在地”编辑为 Canada，方便观察改变
-        "target_new": {"str": " Canada"},
+        "prompt": "{} is a kind of",
+        "subject": "Hot Dog",
+        "target_new": {"str": " tool"},
     }
 
     print(f"[INFO] Loading model: {model_name}")
@@ -137,12 +88,13 @@ def main():
 
     # ====== 3. 执行 ROME 编辑 ======
     print("\n[INFO] Applying ROME edit ...")
-    edited_model, _ = apply_rome_to_model(
+    edited_model, orig_weights = apply_rome_to_model(
         model,
         tok,
         [request],
         hparams,
-        copy=True,  # 保留原模型
+        copy=False,
+        return_orig_weights=True,
     )
 
     # ====== 4. 编辑后评估 ======
@@ -152,11 +104,50 @@ def main():
     print("\n=== AFTER EDIT ===")
     print(edited_completion)
 
-    # ====== 5. 可视化概率变化 ======
+    # ====== 5. 可视化 logits 变化 ======
     output_dir = Path("test_results/rome_quick_demo")
-    fig_path = output_dir / "probability_shift.png"
-    plot_probability_shift(baseline_logits, edited_logits, tok, fig_path)
-    print(f"\n[INFO] Probability comparison saved to: {fig_path.resolve()}")
+    fig_path = output_dir / "topk_logits_shift.png"
+    plot_topk_logits(
+        baseline_logits,
+        edited_logits,
+        tok,
+        fig_path,
+        top_k=10,
+        title=f"ROME Edit: {request['subject']}",
+    )
+    print(f"\n[INFO] Top-k logits comparison saved to: {fig_path.resolve()}")
+
+    y_min = float(min(baseline_logits.min(), edited_logits.min()))
+    y_max = float(max(baseline_logits.max(), edited_logits.max()))
+    pad = max(1.0, 0.05 * (y_max - y_min))
+    shared_limits = (y_min - pad, y_max + pad)
+
+    scatter_before_path = output_dir / "logits_scatter_before.png"
+    scatter_after_path = output_dir / "logits_scatter_after.png"
+    plot_full_logit_scatter(
+        baseline_logits,
+        tok,
+        scatter_before_path,
+        title="Logits Scatter (Before Edit)",
+        y_limits=shared_limits,
+    )
+    plot_full_logit_scatter(
+        edited_logits,
+        tok,
+        scatter_after_path,
+        title="Logits Scatter (After Edit)",
+        y_limits=shared_limits,
+    )
+    print(f"[INFO] Full-logit scatter saved to: {scatter_before_path.resolve()}")
+    print(f"[INFO] Full-logit scatter saved to: {scatter_after_path.resolve()}")
+
+    # ====== 6. 可选：恢复原始权重，便于继续使用该模型 ======
+    if orig_weights:
+        with torch.no_grad():
+            params = dict(model.named_parameters())
+            for name, tensor in orig_weights.items():
+                params[name].copy_(tensor)
+        print("[INFO] Restored original weights")
 
 
 if __name__ == "__main__":
